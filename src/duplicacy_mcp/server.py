@@ -1,6 +1,6 @@
-"""MCP server exposing the duplicacy-web API as tools.
+"""MCP server exposing the duplicacy-web API as structured tools.
 
-The duplicacy-web API is the same internal HTTP API the web UI uses
+The duplicacy-web API is the internal HTTP JSON API the web UI uses
 (endpoints like ``/add_storage``, ``/save_repository``, ``/save_schedule``).
 This server wraps those endpoints as MCP tools so AI clients can inspect and
 administer Duplicacy backups.
@@ -8,105 +8,169 @@ administer Duplicacy backups.
 Configuration (environment variables):
     DUPLICACY_WEB_URL   Base URL of duplicacy-web. Default: http://localhost:3875
     DUPLICACY_COMPUTER  Computer name as known to duplicacy-web. Default: localhost
+    DUPLICACY_TIMEOUT   HTTP read timeout in seconds. Default: 60
+    DUPLICACY_LOG_LEVEL Logging level (DEBUG..CRITICAL). Default: WARNING
 
 Run: ``uv run duplicacy-mcp`` (stdio transport; never write to stdout).
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import sys
-from typing import Any
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated, Any, Literal
 
+import httpx2
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from duplicacy_mcp import __version__
+from duplicacy_mcp.client import DuplicacyClient, Settings
 
 log = logging.getLogger("duplicacy_mcp")
 
-WEB_URL = os.environ.get("DUPLICACY_WEB_URL", "http://localhost:3875").rstrip("/")
-COMPUTER = os.environ.get("DUPLICACY_COMPUTER", "localhost")
+# Module-level aliases so MCPServer's inspect.signature(..., eval_str=True) resolves them.
+AppContext = Context[DuplicacyClient, Any]
+Compression = Literal["lz4", "zstd_default", "zstd_fastest", "zstd_better", "zstd_best"]
+JobType = Literal["backup", "prune", "check"]
+NonEmptyStr = Annotated[str, Field(min_length=1)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
+PositiveInt = Annotated[int, Field(gt=0)]
+WeekdayMask = Annotated[str, Field(pattern=r"^[01]{7}$")]
 
-mcp = MCPServer(
-    "duplicacy-mcp",
-    version="0.1.0",
-    description="Inspect and administer Duplicacy backups via the duplicacy-web API.",
+SERVER_INSTRUCTIONS = (
+    "Inspect get_backup_status or get_schedule_status before using 0-based repository, "
+    "schedule, or job indices; deleting an item shifts subsequent indices. Filter patterns "
+    "are evaluated first-match-wins ('+' includes, '-' excludes). Storage passwords are "
+    "encryption keys and cannot be recovered by duplicacy-web; never log or discard them."
+)
+
+_READ_ONLY_LOCAL = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+_READ_ONLY_REMOTE = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+_CREATE_LOCAL = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
+_CREATE_REMOTE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
+_UPDATE_IDEMPOTENT = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+_REPLACE_IDEMPOTENT = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+_DESTRUCTIVE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
+    open_world_hint=False,
 )
 
 
-async def _post(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """POST JSON to a duplicacy-web endpoint; raise on API-level errors."""
-    import httpx2
-
-    async with httpx2.AsyncClient(base_url=WEB_URL, timeout=60.0) as client:
-        response = await client.post(endpoint, json=payload)
-        response.raise_for_status()
-        data = response.json()
-    message = data.get("message")
-    if message not in (None, "ok"):
-        raise RuntimeError(f"duplicacy-web {endpoint}: {message}")
-    return data
+def _client(ctx: AppContext) -> DuplicacyClient:
+    return ctx.request_context.lifespan_context
 
 
-def _dump(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2, default=str)
+def create_server(
+    settings: Settings | None = None,
+    *,
+    transport: httpx2.AsyncBaseTransport | None = None,
+) -> MCPServer[DuplicacyClient]:
+    """Build and configure an MCPServer bound to a DuplicacyClient lifespan."""
+    resolved = settings if settings is not None else Settings.from_env()
 
+    @asynccontextmanager
+    async def _lifespan(_server: MCPServer[DuplicacyClient]) -> AsyncIterator[DuplicacyClient]:
+        async with DuplicacyClient(resolved, transport=transport) as client:
+            yield client
 
-# --- Status ---------------------------------------------------------------
+    server: MCPServer[DuplicacyClient] = MCPServer(
+        "duplicacy-mcp",
+        title="Duplicacy Web",
+        version=__version__,
+        description="Inspect and administer Duplicacy backups via the duplicacy-web API.",
+        instructions=SERVER_INSTRUCTIONS,
+        lifespan=_lifespan,
+        log_level=resolved.log_level,
+    )
 
+    # --- Status ---------------------------------------------------------------
 
-@mcp.tool()
-async def get_schedule_status() -> str:
-    """Return schedule status: each schedule's next run, pause state, and running jobs.
+    @server.tool(annotations=_READ_ONLY_LOCAL)
+    async def get_schedule_status(ctx: AppContext) -> dict[str, Any]:
+        """Return schedule status: each schedule's next run, pause state, and running jobs.
 
-    Use this to see whether a backup is running or when the next one is due.
-    """
-    return _dump(await _post("/get_schedule_status", {}))
+        Use this to see whether a backup is running or when the next one is due.
+        """
+        return await _client(ctx).post("/get_schedule_status", {})
 
+    @server.tool(annotations=_READ_ONLY_LOCAL)
+    async def get_backup_status(ctx: AppContext) -> dict[str, Any]:
+        """Return per-repository backup status (last run outcome, timestamps, sizes)."""
+        return await _client(ctx).post("/get_backup_status", {})
 
-@mcp.tool()
-async def get_backup_status() -> str:
-    """Return per-repository backup status (last run outcome, timestamps, sizes)."""
-    return _dump(await _post("/get_backup_status", {}))
+    # --- Storages -------------------------------------------------------------
 
+    @server.tool(annotations=_READ_ONLY_LOCAL)
+    async def lookup_storage(name: NonEmptyStr, ctx: AppContext) -> dict[str, Any]:
+        """Look up a storage by name; returns whether it exists and its details.
 
-# --- Storages -------------------------------------------------------------
+        Args:
+            name: Storage name as configured in duplicacy-web.
+        """
+        return await _client(ctx).post("/lookup_storage", {"Name": name})
 
+    @server.tool(annotations=_CREATE_REMOTE)
+    async def create_storage(
+        name: NonEmptyStr,
+        url: NonEmptyStr,
+        password: NonEmptyStr,
+        compression: Compression = "lz4",
+        copy_from: str = "",
+        *,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Create a new backup storage (destination).
 
-@mcp.tool()
-async def lookup_storage(name: str) -> str:
-    """Look up a storage by name; returns whether it exists and its details.
-
-    Args:
-        name: Storage name as configured in duplicacy-web.
-    """
-    return _dump(await _post("/lookup_storage", {"Name": name}))
-
-
-@mcp.tool()
-async def create_storage(
-    name: str,
-    url: str,
-    password: str,
-    compression: str = "lz4",
-    copy_from: str = "",
-) -> str:
-    """Create a new backup storage (destination).
-
-    Args:
-        name: Storage name, unique in duplicacy-web.
-        url: Storage URL. Local path (e.g. /backups/plex), or scheme URLs
-            like b2://bucket, s3://..., sftp://user@host/path.
-        password: Encryption password for the repository. Keep it safe;
-            all backups in this storage are encrypted with it.
-        compression: Chunk compression. One of lz4, zstd_default,
-            zstd_fastest, zstd_better, zstd_best. lz4 suits already-compressed
-            media.
-        copy_from: Name of an existing storage to copy chunk files from
-            (dedupe seeding). Empty string for a fresh storage.
-    """
-    return _dump(
-        await _post(
+        Args:
+            name: Storage name, unique in duplicacy-web.
+            url: Storage URL. Local path (e.g. /backups/plex), or scheme URLs
+                like b2://bucket, s3://..., sftp://user@host/path.
+            password: Encryption password for the repository. Keep it safe;
+                all backups in this storage are encrypted with it.
+            compression: Chunk compression. One of lz4, zstd_default,
+                zstd_fastest, zstd_better, zstd_best. lz4 suits already-compressed
+                media.
+            copy_from: Name of an existing storage to copy chunk files from
+                (dedupe seeding). Empty string for a fresh storage.
+        """
+        return await _client(ctx).post(
             "/add_storage",
             {
                 "storage_url": url,
@@ -118,110 +182,116 @@ async def create_storage(
                 "rsa_key_file": "",
             },
         )
-    )
 
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def delete_storage(name: NonEmptyStr, ctx: AppContext) -> dict[str, Any]:
+        """Delete a storage configuration. Existing backups in it are NOT deleted.
 
-@mcp.tool()
-async def delete_storage(name: str) -> str:
-    """Delete a storage configuration. Existing backups in it are NOT deleted.
+        Args:
+            name: Storage name to remove.
+        """
+        return await _client(ctx).post("/delete_storage", {"storage": name})
 
-    Args:
-        name: Storage name to remove.
-    """
-    return _dump(await _post("/delete_storage", {"storage": name}))
+    # --- Repositories ---------------------------------------------------------
 
+    @server.tool(annotations=_READ_ONLY_REMOTE)
+    async def list_repositories(storage: NonEmptyStr, ctx: AppContext) -> dict[str, Any]:
+        """List backup repository IDs that exist in a storage.
 
-# --- Repositories ---------------------------------------------------------
+        Args:
+            storage: Storage name.
+        """
+        return await _client(ctx).post("/list_repositories", {"storage": storage})
 
+    @server.tool(annotations=_CREATE_LOCAL)
+    async def create_repository(
+        id: NonEmptyStr,
+        path: NonEmptyStr,
+        storage: NonEmptyStr,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Create a backup repository: one source directory backed up to one storage.
 
-@mcp.tool()
-async def list_repositories(storage: str) -> str:
-    """List backup repository IDs that exist in a storage.
-
-    Args:
-        storage: Storage name.
-    """
-    return _dump(await _post("/list_repositories", {"storage": storage}))
-
-
-@mcp.tool()
-async def create_repository(id: str, path: str, storage: str) -> str:
-    """Create a backup repository: one source directory backed up to one storage.
-
-    Args:
-        id: Repository ID, unique per computer (e.g. Plex-media).
-        path: Source directory inside the duplicacy-web container (e.g. /source/plex).
-        storage: Destination storage name.
-    """
-    return _dump(
-        await _post(
+        Args:
+            id: Repository ID, unique per computer (e.g. Plex-media).
+            path: Source directory inside the duplicacy-web container (e.g. /source/plex).
+            storage: Destination storage name.
+        """
+        client = _client(ctx)
+        return await client.post(
             "/save_repository",
-            {"index": -1, "id": id, "path": path, "storage": storage, "computer": COMPUTER},
+            {"index": -1, "id": id, "path": path, "storage": storage, "computer": client.computer},
         )
-    )
 
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def delete_repository(index: NonNegativeInt, ctx: AppContext) -> dict[str, Any]:
+        """Delete a repository configuration. Existing backups remain in storage.
 
-@mcp.tool()
-async def delete_repository(index: int) -> str:
-    """Delete a repository configuration. Existing backups remain in storage.
+        Args:
+            index: Repository index (0-based, as shown by get_backup_status).
+        """
+        client = _client(ctx)
+        return await client.post(
+            "/delete_repository",
+            {"index": index, "computer": client.computer},
+        )
 
-    Args:
-        index: Repository index (0-based, as shown by get_backup_status).
-    """
-    return _dump(await _post("/delete_repository", {"index": index, "computer": COMPUTER}))
+    @server.tool(annotations=_READ_ONLY_LOCAL)
+    async def get_filters(index: NonNegativeInt, ctx: AppContext) -> dict[str, Any]:
+        """Return the include/exclude filter patterns of a repository.
 
+        Args:
+            index: Repository index (0-based).
+        """
+        client = _client(ctx)
+        return await client.post("/get_patterns", {"computer": client.computer, "index": index})
 
-@mcp.tool()
-async def get_filters(index: int) -> str:
-    """Return the include/exclude filter patterns of a repository.
+    @server.tool(annotations=_REPLACE_IDEMPOTENT)
+    async def set_filters(
+        index: NonNegativeInt,
+        patterns: list[str],
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Set the include/exclude filter patterns of a repository.
 
-    Args:
-        index: Repository index (0-based).
-    """
-    return _dump(await _post("/get_patterns", {"computer": COMPUTER, "index": index}))
+        Patterns are duplicacy filter rules, one per entry, first match wins:
+        ``+dir/*`` includes, ``-*`` excludes everything else. E.g.
+        ["+movies/*", "+tv/*", "-*"] backs up only movies and tv.
 
+        Args:
+            index: Repository index (0-based).
+            patterns: Filter rules in order.
+        """
+        client = _client(ctx)
+        return await client.post(
+            "/save_patterns",
+            {"computer": client.computer, "index": index, "patterns": patterns},
+        )
 
-@mcp.tool()
-async def set_filters(index: int, patterns: list[str]) -> str:
-    """Set the include/exclude filter patterns of a repository.
+    # --- Schedules and jobs ---------------------------------------------------
 
-    Patterns are duplicacy filter rules, one per entry, first match wins:
-    ``+dir/*`` includes, ``-*`` excludes everything else. E.g.
-    ["+movies/*", "+tv/*", "-*"] backs up only movies and tv.
+    @server.tool(annotations=_CREATE_LOCAL)
+    async def create_schedule(
+        name: NonEmptyStr,
+        start_time: NonEmptyStr,
+        frequency: PositiveInt = 86400,
+        days: WeekdayMask = "1111111",
+        max_time: NonEmptyStr = "00:00",
+        *,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Create a backup schedule (container for one or more jobs).
 
-    Args:
-        index: Repository index (0-based).
-        patterns: Filter rules in order.
-    """
-    return _dump(
-        await _post("/save_patterns", {"computer": COMPUTER, "index": index, "patterns": patterns})
-    )
-
-
-# --- Schedules and jobs ---------------------------------------------------
-
-
-@mcp.tool()
-async def create_schedule(
-    name: str,
-    start_time: str,
-    frequency: int = 86400,
-    days: str = "1111111",
-    max_time: str = "00:00",
-) -> str:
-    """Create a backup schedule (container for one or more jobs).
-
-    Args:
-        name: Schedule name, unique in duplicacy-web.
-        start_time: Daily start time as HH:MMAM/PM, e.g. "02:00AM" or "10:35AM".
-        frequency: Interval in seconds (86400 = daily).
-        days: 7-char bitmask of active weekdays, built Sunday-first,
-            "1111111" = every day, "0000000" = never (disabled).
-        max_time: Latest time of day the schedule may start, HH:MMAM/PM.
-            "00:00" = no limit.
-    """
-    return _dump(
-        await _post(
+        Args:
+            name: Schedule name, unique in duplicacy-web.
+            start_time: Daily start time as HH:MMAM/PM, e.g. "02:00AM" or "10:35AM".
+            frequency: Interval in seconds (86400 = daily).
+            days: 7-char bitmask of active weekdays, built Sunday-first,
+                "1111111" = every day, "0000000" = never (disabled).
+            max_time: Latest time of day the schedule may start, HH:MMAM/PM.
+                "00:00" = no limit.
+        """
+        return await _client(ctx).post(
             "/save_schedule",
             {
                 "scheduleIndex": -1,
@@ -232,51 +302,52 @@ async def create_schedule(
                 "days": days,
             },
         )
-    )
 
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def delete_schedule(schedule_index: NonNegativeInt, ctx: AppContext) -> dict[str, Any]:
+        """Delete a schedule and its jobs.
 
-@mcp.tool()
-async def delete_schedule(schedule_index: int) -> str:
-    """Delete a schedule and its jobs.
+        Args:
+            schedule_index: Schedule index (0-based, as shown by get_schedule_status).
+        """
+        return await _client(ctx).post("/delete_schedule", {"scheduleIndex": schedule_index})
 
-    Args:
-        schedule_index: Schedule index (0-based, as shown by get_schedule_status).
-    """
-    return _dump(await _post("/delete_schedule", {"scheduleIndex": schedule_index}))
+    @server.tool(annotations=_CREATE_LOCAL)
+    async def add_job(
+        schedule_index: NonNegativeInt,
+        type: JobType,
+        repository: NonNegativeInt,
+        destination: NonEmptyStr,
+        source: str = "",
+        options: str = "",
+        parallel: bool = False,
+        *,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Add a job (backup, prune, or check) to a schedule.
 
-
-@mcp.tool()
-async def add_job(
-    schedule_index: int,
-    type: str,
-    repository: int,
-    destination: str,
-    source: str = "",
-    options: str = "",
-    parallel: bool = False,
-) -> str:
-    """Add a job (backup, prune, or check) to a schedule.
-
-    Args:
-        schedule_index: Schedule index (0-based).
-        type: Job type: "backup", "prune", or "check".
-        repository: Repository index (0-based).
-        destination: Storage name the job writes to (or reads from for
-            prune/check).
-        source: Source path for backup jobs (e.g. /source/plex); empty for
-            prune/check.
-        options: Extra duplicacy CLI options. Backup example: "-threads 4".
-            Prune example: "-keep 0:30 -a" (keep the 30 newest snapshots).
-            Check example: "-fossils".
-        parallel: Whether the job may run in parallel with others.
-    """
-    return _dump(
-        await _post(
+        Args:
+            schedule_index: Schedule index (0-based).
+            type: Job type: "backup", "prune", or "check".
+            repository: Repository index (0-based).
+            destination: Storage name the job writes to (or reads from for
+                prune/check).
+            source: Source path for backup jobs (e.g. /source/plex); empty for
+                prune/check.
+            options: Extra duplicacy CLI options. Backup example: "-threads 4".
+                Prune example: "-keep 0:30 -a" (keep the 30 newest snapshots).
+                Check example: "-fossils".
+            parallel: Whether the job may run in parallel with others.
+        """
+        if type == "backup" and not source.strip():
+            raise ValueError("source path is required for backup jobs")
+        client = _client(ctx)
+        return await client.post(
             "/add_job",
             {
                 "scheduleIndex": schedule_index,
                 "type": type,
-                "computer": COMPUTER,
+                "computer": client.computer,
                 "repository": repository,
                 "source": source,
                 "destination": destination,
@@ -284,39 +355,78 @@ async def add_job(
                 "parallel": parallel,
             },
         )
-    )
+
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def delete_job(
+        schedule_index: NonNegativeInt,
+        job_index: NonNegativeInt,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Remove a job from a schedule.
+
+        Args:
+            schedule_index: Schedule index (0-based).
+            job_index: Job index within the schedule (0-based).
+        """
+        return await _client(ctx).post(
+            "/delete_job",
+            {"scheduleIndex": schedule_index, "jobIndex": job_index},
+        )
+
+    @server.tool(annotations=_UPDATE_IDEMPOTENT)
+    async def start_stop_schedule(
+        schedule_index: NonNegativeInt,
+        is_start: bool,
+        ctx: AppContext,
+    ) -> dict[str, Any]:
+        """Start (enable) or stop (disable) a schedule.
+
+        Args:
+            schedule_index: Schedule index (0-based).
+            is_start: True to enable the schedule, False to disable it.
+        """
+        return await _client(ctx).post(
+            "/start_stop_schedule",
+            {"scheduleIndex": schedule_index, "isStart": is_start},
+        )
+
+    return server
 
 
-@mcp.tool()
-async def delete_job(schedule_index: int, job_index: int) -> str:
-    """Remove a job from a schedule.
-
-    Args:
-        schedule_index: Schedule index (0-based).
-        job_index: Job index within the schedule (0-based).
-    """
-    return _dump(
-        await _post("/delete_job", {"scheduleIndex": schedule_index, "jobIndex": job_index})
-    )
+_default_server: MCPServer[DuplicacyClient] | None = None
 
 
-@mcp.tool()
-async def start_stop_schedule(schedule_index: int, is_start: bool) -> str:
-    """Start (enable) or stop (disable) a schedule.
-
-    Args:
-        schedule_index: Schedule index (0-based).
-        is_start: True to enable the schedule, False to disable it.
-    """
-    return _dump(
-        await _post("/start_stop_schedule", {"scheduleIndex": schedule_index, "isStart": is_start})
-    )
+def __getattr__(name: str) -> Any:
+    global _default_server
+    if name == "mcp":
+        if _default_server is None:
+            _default_server = create_server()
+        return _default_server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
-    log.info("duplicacy-mcp %s -> %s (computer %s)", "0.1.0", WEB_URL, COMPUTER)
-    mcp.run(transport="stdio")
+    """Validate configuration from the environment and run the stdio MCP server."""
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    server = create_server(settings)
+    logging.basicConfig(
+        level=settings.log_level,
+        stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    log.info(
+        "duplicacy-mcp %s -> %s (computer %s)",
+        __version__,
+        settings.safe_base_url,
+        settings.computer,
+    )
+    server.run(transport="stdio")
 
 
 if __name__ == "__main__":

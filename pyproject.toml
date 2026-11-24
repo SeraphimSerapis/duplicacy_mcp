@@ -6,8 +6,15 @@ requires-python = ">=3.12"
 readme = "README.md"
 license = "MIT"
 dependencies = [
-    "mcp>=2,<3",
-    "httpx2>=2,<3",
+    "mcp>=2.3,<3",
+    "httpx2>=2.16,<3",
+    "pydantic>=2.14,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2,<10",
+    "ruff>=0.17,<1",
 ]
 
 [build-system]
@@ -19,3 +26,17 @@ packages = ["src/duplicacy_mcp"]
 
 [project.scripts]
 duplicacy-mcp = "duplicacy_mcp.server:main"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "S", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
